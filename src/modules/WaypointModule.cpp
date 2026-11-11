@@ -146,17 +146,17 @@ void drawDottedHorizontalDivider(OLEDDisplay *display, int16_t xStart, int16_t x
     }
 }
 
-void notifyWaypointReceived(const StoredWaypoint &stored)
+void notifyWaypointReceived(const StoredWaypoint &stored, bool navigating = false)
 {
     if (screen) {
         const std::string waypointName = trimmedWaypointText(stored.waypoint.name);
-        if (!waypointName.empty()) {
-            char banner[96];
-            snprintf(banner, sizeof(banner), "New Waypoint\n%s", waypointName.c_str());
-            screen->showSimpleBanner(banner, 3000);
-        } else {
-            screen->showSimpleBanner("New Waypoint", 3000);
-        }
+        const char *verb = navigating ? "Navigating" : "New Waypoint";
+        char banner[96];
+        if (!waypointName.empty())
+            snprintf(banner, sizeof(banner), "%s\n%s", verb, waypointName.c_str());
+        else
+            snprintf(banner, sizeof(banner), "%s", verb);
+        screen->showSimpleBanner(banner, 3000);
     }
 
     if (externalNotificationModule)
@@ -180,11 +180,20 @@ ProcessMessage WaypointModule::handleReceived(const meshtastic_MeshPacket &mp)
     if (!waypointStore.addFromPacket(mp, isFromUs(&mp), &stored))
         return ProcessMessage::CONTINUE;
 
+    // A waypoint addressed straight at this node is a request to go there. It is the only way an
+    // app can hand us a navigation target without a wire-format change (the waypoint editor's
+    // "Send to" picker can target a single node), so honour it by arming the target. Broadcast
+    // waypoints deliberately do not do this: anyone on the mesh could repoint your arrow.
+    const bool navigationRequest = !isFromUs(&mp) && mp.to == nodeDB->getNodeNum() &&
+                                   !WaypointStore::isExpired(stored);
+    if (navigationRequest)
+        waypointStore.setNavTarget(stored.waypoint.id);
+
     powerFSM.trigger(EVENT_RECEIVED_MSG);
 
 #if HAS_SCREEN
     if (!isFromUs(&mp) && !WaypointStore::isExpired(stored))
-        notifyWaypointReceived(stored);
+        notifyWaypointReceived(stored, navigationRequest);
 
     UIFrameEvent e;
     // Refresh the waypoint frame list quietly; new waypoints alert via banner/sound but do not
