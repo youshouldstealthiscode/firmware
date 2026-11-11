@@ -41,6 +41,8 @@ class menuHandler
         GeofenceWaypointMenu,
         GeofenceOptionsMenu,
         RemoveWaypointMenu,
+        WaypointsMenu,
+        SaveWaypointMenu,
         TestMenu,
         HostPowerOffMenu,
         NumberTest,
@@ -117,6 +119,10 @@ class menuHandler
     static void geofenceWaypointMenu();
     static void geofenceOptionsMenu();
     static void removeWaypointMenu();
+    /// Pick a saved waypoint and act on it (navigate / geofence / remove).
+    static void waypointsMenu();
+    /// Save the current position as a waypoint, named from a canned list.
+    static void saveWaypointMenu();
     static void traceRouteMenu();
     static void testMenu();
     static void hostPowerOffMenu();

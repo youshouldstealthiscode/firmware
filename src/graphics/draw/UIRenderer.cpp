@@ -24,6 +24,9 @@
 #include "graphics/images.h"
 #include "main.h"
 #include "target_specific.h"
+#if !MESHTASTIC_EXCLUDE_WAYPOINT
+#include "WaypointStore.h"
+#endif
 #ifdef COMPASS_SENSOR_DEBUG
 #include "motion/MotionSensor.h"
 #endif
@@ -398,6 +401,51 @@ static void drawCompassStatusText(OLEDDisplay *display, int16_t compassX, int16_
     display->drawString(compassX, compassY, statusLine2);
     display->setTextAlignment(TEXT_ALIGN_LEFT);
 }
+
+#if !MESHTASTIC_EXCLUDE_WAYPOINT && HAS_GPS
+// Mirrors WaypointModule's card formatting; the two must agree or the same distance reads two ways.
+static void formatNavDistance(char *out, size_t outSize, float meters)
+{
+    if (config.display.units == meshtastic_Config_DisplayConfig_DisplayUnits_IMPERIAL) {
+        const float feet = meters * METERS_TO_FEET;
+        snprintf(out, outSize, feet < (2 * MILES_TO_FEET) ? "%.0fft" : "%.1fmi",
+                 feet < (2 * MILES_TO_FEET) ? feet : feet / MILES_TO_FEET);
+    } else {
+        snprintf(out, outSize, meters < 2000 ? "%.0fm" : "%.1fkm", meters < 2000 ? meters : meters / 1000);
+    }
+}
+
+/// Navigation view for the Position frame: bearing arrow to the waypoint we are walking to, with
+/// the remaining distance inside the ring. Returns false when there is no target, so the caller
+/// falls back to the plain compass.
+static bool drawNavTargetCompass(OLEDDisplay *display, int16_t compassX, int16_t compassY, int16_t compassRadius,
+                                 bool validHeading, float heading, double myLat, double myLon)
+{
+    const StoredWaypoint *nav = waypointStore.navTarget();
+    if (!nav || !nav->waypoint.has_latitude_i || !nav->waypoint.has_longitude_i)
+        return false;
+
+    const double targetLat = nav->waypoint.latitude_i * 1e-7;
+    const double targetLon = nav->waypoint.longitude_i * 1e-7;
+
+    char distance[16];
+    formatNavDistance(distance, sizeof(distance), GeoCoord::latLongToMeter(myLat, myLon, targetLat, targetLon));
+
+    display->drawCircle(compassX, compassY, compassRadius);
+    if (validHeading) {
+        const float bearing = CompassRenderer::adjustBearingForCompassMode(
+            GeoCoord::bearing(myLat, myLon, targetLat, targetLon), heading);
+        CompassRenderer::drawNodeHeading(display, compassX, compassY, static_cast<uint16_t>(compassRadius * 2), bearing);
+    }
+
+    // Inside the ring, below the arrow: the arrow's tail is at the centre, so this never overlaps it.
+    display->setFont(FONT_SMALL);
+    display->setTextAlignment(TEXT_ALIGN_CENTER);
+    display->drawString(compassX, compassY + compassRadius - FONT_HEIGHT_SMALL + 1, distance);
+    display->setTextAlignment(TEXT_ALIGN_LEFT);
+    return true;
+}
+#endif
 
 static void drawBearingCompassOrStatus(OLEDDisplay *display, int16_t compassX, int16_t compassY, int16_t compassRadius,
                                        bool showCompass, float myHeading, float bearing, const char *statusLine1,
@@ -1855,19 +1903,24 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
     const bool hasSensorHeading = screen->hasHeading();
     float heading = 0.0f;
     bool validHeading = false;
+    // Own position, kept outside the heading block: the nav view needs it even when the heading is
+    // not resolvable yet (distance to a target is useful while standing still).
+    double headingLat = 0.0;
+    double headingLon = 0.0;
+    bool havePosition = false;
     const char *statusLine1 = nullptr;
     const char *statusLine2 = nullptr;
     if (hasSensorHeading || hasLiveGpsFix || hasOwnPositionFix) {
-        double headingLat = 0.0;
-        double headingLon = 0.0;
         if (hasLiveGpsFix) {
             headingLat = DegD(gpsStatus->getLatitude());
             headingLon = DegD(gpsStatus->getLongitude());
+            havePosition = true;
         } else if (hasOwnPositionFix) {
             meshtastic_PositionLite ownPos;
             if (nodeDB->copyNodePosition(ourNode->num, ownPos)) {
                 headingLat = DegD(ownPos.latitude_i);
                 headingLon = DegD(ownPos.longitude_i);
+                havePosition = true;
             }
         }
         validHeading = CompassRenderer::getHeadingRadians(headingLat, headingLon, heading);
@@ -1899,8 +1952,15 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
                 compassRadius = 8;
             if (compassRadius * 2 > SCREEN_WIDTH - 4)
                 compassRadius = (SCREEN_WIDTH - 4) / 2;
-            drawDetailedCompassOrStatus(display, x + SCREEN_WIDTH / 2, compassTop + availableHeight / 2, compassRadius,
-                                        validHeading, heading, statusLine1, statusLine2, /*showRing=*/false);
+            bool drewNav = false;
+#if !MESHTASTIC_EXCLUDE_WAYPOINT
+            if (havePosition)
+                drewNav = drawNavTargetCompass(display, x + SCREEN_WIDTH / 2, compassTop + availableHeight / 2,
+                                               compassRadius, validHeading, heading, headingLat, headingLon);
+#endif
+            if (!drewNav)
+                drawDetailedCompassOrStatus(display, x + SCREEN_WIDTH / 2, compassTop + availableHeight / 2, compassRadius,
+                                            validHeading, heading, statusLine1, statusLine2, /*showRing=*/false);
         } else if (hasGpsData) {
             UIRenderer::drawGpsCoordinates(display, x, textPos[line++], gpsStatus, "line1");
             if (uiconfig.gps_format != meshtastic_DeviceUIConfig_GpsCoordinateFormat_OLC &&
@@ -1991,8 +2051,15 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
             // Center vertically and nudge down slightly to keep "N" clear of header
             const int16_t compassY = topY + (usableHeight / 2) + ((FONT_HEIGHT_SMALL - 1) / 2) + 2;
 
-            drawDetailedCompassOrStatus(display, compassX, compassY, compassRadius, validHeading, heading, statusLine1,
-                                        statusLine2);
+            bool drewNav = false;
+#if !MESHTASTIC_EXCLUDE_WAYPOINT
+            if (havePosition)
+                drewNav = drawNavTargetCompass(display, compassX, compassY, compassRadius, validHeading, heading, headingLat,
+                                               headingLon);
+#endif
+            if (!drewNav)
+                drawDetailedCompassOrStatus(display, compassX, compassY, compassRadius, validHeading, heading, statusLine1,
+                                            statusLine2);
         } else {
             // Portrait or square: put compass at the bottom and centered, scaled to fit available space
             // For E-Ink screens, account for navigation bar at the bottom!
@@ -2017,8 +2084,15 @@ void UIRenderer::drawCompassAndLocationScreen(OLEDDisplay *display, OLEDDisplayU
             int compassX = x + SCREEN_WIDTH / 2;
             int compassY = yBelowContent + availableHeight / 2;
 
-            drawDetailedCompassOrStatus(display, compassX, compassY, compassRadius, validHeading, heading, statusLine1,
-                                        statusLine2);
+            bool drewNav = false;
+#if !MESHTASTIC_EXCLUDE_WAYPOINT
+            if (havePosition)
+                drewNav = drawNavTargetCompass(display, compassX, compassY, compassRadius, validHeading, heading, headingLat,
+                                               headingLon);
+#endif
+            if (!drewNav)
+                drawDetailedCompassOrStatus(display, compassX, compassY, compassRadius, validHeading, heading, statusLine1,
+                                            statusLine2);
         }
     }
 #endif

@@ -48,6 +48,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <utility>
 
@@ -59,6 +60,16 @@ namespace
 
 #if !MESHTASTIC_EXCLUDE_WAYPOINT
 uint32_t selectedGeofenceWaypointId = 0;
+
+/// There is no keyboard, so saved waypoints get canned names. Duplicates take a numeric suffix.
+bool waypointNameTaken(const char *name)
+{
+    for (const StoredWaypoint &entry : waypointStore.getWaypoints()) {
+        if (strncmp(entry.waypoint.name, name, sizeof(entry.waypoint.name)) == 0)
+            return true;
+    }
+    return false;
+}
 #endif
 
 template <typename X> struct Identity {
@@ -1493,7 +1504,9 @@ void menuHandler::positionBaseMenu()
         CompassCalibrate,
         GPSSmartPosition,
         GPSUpdateInterval,
-        GPSPositionBroadcast
+        GPSPositionBroadcast,
+        Waypoints,
+        SaveWaypoint
     };
 
     static const PositionMenuOption baseOptions[] = {
@@ -1504,6 +1517,8 @@ void menuHandler::positionBaseMenu()
         {"Update Interval", OptionsAction::Select, static_cast<int>(PositionAction::GPSUpdateInterval)},
         {"Broadcast Interval", OptionsAction::Select, static_cast<int>(PositionAction::GPSPositionBroadcast)},
         {"Compass", OptionsAction::Select, static_cast<int>(PositionAction::CompassMenu)},
+        {"Waypoints", OptionsAction::Select, static_cast<int>(PositionAction::Waypoints)},
+        {"Save Waypoint", OptionsAction::Select, static_cast<int>(PositionAction::SaveWaypoint)},
     };
 
     static const PositionMenuOption calibrateOptions[] = {
@@ -1515,6 +1530,8 @@ void menuHandler::positionBaseMenu()
         {"Broadcast Interval", OptionsAction::Select, static_cast<int>(PositionAction::GPSPositionBroadcast)},
         {"Compass", OptionsAction::Select, static_cast<int>(PositionAction::CompassMenu)},
         {"Compass Calibrate", OptionsAction::Select, static_cast<int>(PositionAction::CompassCalibrate)},
+        {"Waypoints", OptionsAction::Select, static_cast<int>(PositionAction::Waypoints)},
+        {"Save Waypoint", OptionsAction::Select, static_cast<int>(PositionAction::SaveWaypoint)},
     };
 
     constexpr size_t baseCount = sizeof(baseOptions) / sizeof(baseOptions[0]);
@@ -1569,6 +1586,14 @@ void menuHandler::positionBaseMenu()
             break;
         case PositionAction::GPSPositionBroadcast:
             menuQueue = GpsPositionBroadcastMenu;
+            screen->runNow();
+            break;
+        case PositionAction::Waypoints:
+            menuQueue = WaypointsMenu;
+            screen->runNow();
+            break;
+        case PositionAction::SaveWaypoint:
+            menuQueue = SaveWaypointMenu;
             screen->runNow();
             break;
         }
@@ -2641,6 +2666,128 @@ void menuHandler::removeWaypointMenu()
 #endif
 }
 
+void menuHandler::waypointsMenu()
+{
+#if MESHTASTIC_EXCLUDE_WAYPOINT
+    menuQueue = MenuNone;
+#else
+    // Back, an optional "Stop Navigating", then one entry per saved waypoint.
+    static const char *optionsArray[WAYPOINT_HISTORY_LIMIT + 2];
+    static uint32_t waypointIds[WAYPOINT_HISTORY_LIMIT + 2];
+    static std::string labelStorage[WAYPOINT_HISTORY_LIMIT + 2];
+
+    const uint32_t navId = waypointStore.getNavTargetId();
+    int options = 0;
+    optionsArray[options] = "Back";
+    waypointIds[options++] = 0;
+
+    if (navId != 0) {
+        optionsArray[options] = "Stop Navigating";
+        waypointIds[options++] = 0;
+    }
+
+    const int firstWaypointOption = options;
+    for (const StoredWaypoint &entry : waypointStore.getWaypoints()) {
+        if (options >= WAYPOINT_HISTORY_LIMIT + 2 || WaypointStore::isExpired(entry))
+            continue;
+
+        std::string name = sanitizeString(entry.waypoint.name);
+        if (name.empty())
+            name = "Unnamed Waypoint";
+        if (entry.waypoint.id == navId)
+            name = "* " + name; // the picker is the only place that can show the active target
+        labelStorage[options] = name.substr(0, 20);
+        optionsArray[options] = labelStorage[options].c_str();
+        waypointIds[options] = entry.waypoint.id;
+        ++options;
+    }
+
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = (options > firstWaypointOption) ? "Waypoints" : "No Waypoints";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = options;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected < 0 || selected > WAYPOINT_HISTORY_LIMIT + 1)
+            return;
+
+        if (selected == 0) {
+            menuQueue = PositionBaseMenu;
+            screen->runNow();
+            return;
+        }
+
+        // "Stop Navigating" is only in the table while a target is set, so index 1 is unambiguous.
+        if (waypointStore.getNavTargetId() != 0 && selected == 1) {
+            waypointStore.setNavTarget(0);
+            screen->showSimpleBanner("Navigation\nCleared", 3000);
+            return;
+        }
+
+        const uint32_t waypointId = waypointIds[selected];
+        if (waypointId == 0)
+            return;
+
+        waypointStore.setNavTarget(waypointId);
+
+        const StoredWaypoint *entry = waypointStore.findWaypoint(waypointId);
+        std::string name = entry ? sanitizeString(entry->waypoint.name) : std::string();
+        if (name.empty())
+            name = "Waypoint";
+        char banner[64];
+        snprintf(banner, sizeof(banner), "Navigating\n%s", name.substr(0, 16).c_str());
+        screen->showSimpleBanner(banner, 3000);
+
+        // The Position frame reads the target on its next draw; refresh so it happens now.
+        screen->setFrames(graphics::Screen::FOCUS_DEFAULT);
+    };
+    screen->showOverlayBanner(bannerOptions);
+#endif
+}
+
+void menuHandler::saveWaypointMenu()
+{
+#if MESHTASTIC_EXCLUDE_WAYPOINT
+    menuQueue = MenuNone;
+#else
+    // No keyboard on a one-button OLED, so the name comes from a canned list.
+    static const char *cannedNames[] = {"Camp", "Truck", "Water", "Trailhead", "Home"};
+    constexpr int cannedCount = sizeof(cannedNames) / sizeof(cannedNames[0]);
+    static const char *optionsArray[cannedCount + 1];
+
+    optionsArray[0] = "Back";
+    for (int i = 0; i < cannedCount; ++i)
+        optionsArray[i + 1] = cannedNames[i];
+
+    BannerOverlayOptions bannerOptions;
+    bannerOptions.message = "Save Waypoint";
+    bannerOptions.optionsArrayPtr = optionsArray;
+    bannerOptions.optionsCount = cannedCount + 1;
+    bannerOptions.bannerCallback = [](int selected) -> void {
+        if (selected <= 0 || selected > cannedCount)
+            return;
+
+        // Duplicates get a numeric suffix: "Camp", "Camp 2", "Camp 3"…
+        char name[32];
+        snprintf(name, sizeof(name), "%s", cannedNames[selected - 1]);
+        for (int suffix = 2; waypointNameTaken(name) && suffix < 100; ++suffix)
+            snprintf(name, sizeof(name), "%s %d", cannedNames[selected - 1], suffix);
+
+        if (!waypointModule || !waypointModule->createFromCurrentPosition(name)) {
+            screen->showSimpleBanner("No GPS Fix", 3000);
+            return;
+        }
+
+        char banner[64];
+        snprintf(banner, sizeof(banner), "Saved\n%s", name);
+        screen->showSimpleBanner(banner, 3000);
+
+        // The new waypoint arrives as its own frame; regenerate so the card shows up.
+        screen->setFrames(graphics::Screen::FOCUS_DEFAULT);
+    };
+    screen->showOverlayBanner(bannerOptions);
+#endif
+}
+
 void menuHandler::traceRouteMenu()
 {
     screen->showNodePicker("Node to Trace", 30000, [](uint32_t nodenum) -> void {
@@ -3331,6 +3478,12 @@ void menuHandler::handleMenuSwitch(OLEDDisplay *display)
         break;
     case RemoveWaypointMenu:
         removeWaypointMenu();
+        break;
+    case WaypointsMenu:
+        waypointsMenu();
+        break;
+    case SaveWaypointMenu:
+        saveWaypointMenu();
         break;
     case TraceRouteMenu:
         traceRouteMenu();

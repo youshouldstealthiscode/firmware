@@ -19,6 +19,14 @@ class WaypointModule : public SinglePortModule, public Observable<const UIFrameE
 #if !MESHTASTIC_EXCLUDE_WAYPOINT
     /// Broadcast an expired copy of the waypoint so the mesh (and we) discard it.
     bool broadcastDelete(uint32_t waypointId);
+
+    /// Broadcast a brand-new waypoint owned by this radio. expireEpoch of 0 means never expires.
+    /// Our own packet loops back through handleReceived(), so the new waypoint lands in the store
+    /// and on flash without a second save call.
+    bool broadcastCreate(const char *name, double lat, double lon, uint32_t expireEpoch = 0);
+
+    /// broadcastCreate() at our own last known position. False when there is no fix yet.
+    bool createFromCurrentPosition(const char *name, uint32_t expireEpoch = 0);
 #endif
   protected:
     /** Called to handle a particular incoming message

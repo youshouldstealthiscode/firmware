@@ -21,6 +21,11 @@ namespace
 constexpr uint8_t WAYPOINT_STORE_VERSION = 3;
 constexpr const char *WAYPOINT_STORE_FILENAME = "/Waypoints_default.wpts";
 
+// The nav target is UI state, not mesh state, so it lives in its own tiny file: bumping the
+// waypoint store version to add a field would discard every stored waypoint on upgrade.
+constexpr uint8_t WAYPOINT_NAV_TARGET_VERSION = 1;
+constexpr const char *WAYPOINT_NAV_TARGET_FILENAME = "/Waypoints_nav.target";
+
 #ifndef WAYPOINT_AUTOSAVE_INTERVAL_SEC
 #define WAYPOINT_AUTOSAVE_INTERVAL_SEC (2 * 60 * 60)
 #endif
@@ -66,6 +71,43 @@ void persistWaypointStore()
 {
     LOG_INFO("Autosaving WaypointStore to flash");
     waypointStore.saveToFlash();
+}
+
+void writeNavTargetFile(uint32_t id)
+{
+#if ENABLE_WAYPOINT_PERSISTENCE && defined(FSCom)
+    SafeFile f(WAYPOINT_NAV_TARGET_FILENAME, false);
+    {
+        concurrency::LockGuard guard(spiLock);
+        const uint8_t version = WAYPOINT_NAV_TARGET_VERSION;
+        f.write(&version, 1);
+        f.write(reinterpret_cast<const uint8_t *>(&id), sizeof(id));
+    }
+    f.close();
+#else
+    (void)id;
+#endif
+}
+
+uint32_t readNavTargetFile()
+{
+    uint32_t id = 0;
+#if ENABLE_WAYPOINT_PERSISTENCE && defined(FSCom)
+    concurrency::LockGuard guard(spiLock);
+    if (!FSCom.exists(WAYPOINT_NAV_TARGET_FILENAME))
+        return 0;
+
+    auto f = FSCom.open(WAYPOINT_NAV_TARGET_FILENAME, FILE_O_READ);
+    if (!f)
+        return 0;
+
+    uint8_t version = 0;
+    f.readBytes(reinterpret_cast<char *>(&version), 1);
+    if (version == WAYPOINT_NAV_TARGET_VERSION)
+        f.readBytes(reinterpret_cast<char *>(&id), sizeof(id));
+    f.close();
+#endif
+    return id;
 }
 
 } // namespace
@@ -125,6 +167,26 @@ const StoredWaypoint *WaypointStore::findWaypoint(uint32_t id) const
             return &entry;
     }
     return nullptr;
+}
+
+bool WaypointStore::setNavTarget(uint32_t id)
+{
+    if (navTargetId == id)
+        return true;
+
+    navTargetId = id;
+    writeNavTargetFile(id);
+    notifyChanged();
+    return true;
+}
+
+const StoredWaypoint *WaypointStore::navTarget() const
+{
+    // A stale id is harmless: an expired or removed waypoint simply stops resolving, and the
+    // target comes back by itself if the same waypoint is broadcast again.
+    if (navTargetId == 0)
+        return nullptr;
+    return findWaypoint(navTargetId);
 }
 
 bool WaypointStore::removeWaypointById(uint32_t id)
@@ -350,6 +412,11 @@ void WaypointStore::loadFromFlash()
     g_waypointStoreHasUnsavedChanges = false;
     g_lastWaypointAutoSaveMs = Time::getMillis();
 #endif
+
+    // Restore the nav target last: it is only meaningful for a waypoint we actually loaded.
+    navTargetId = readNavTargetFile();
+    if (navTargetId != 0 && findWaypoint(navTargetId) == nullptr)
+        navTargetId = 0;
 }
 
 void WaypointStore::clearAllWaypoints()
@@ -383,6 +450,12 @@ void WaypointStore::clearAllWaypoints()
     g_waypointStoreHasUnsavedChanges = false;
     g_lastWaypointAutoSaveMs = Time::getMillis();
 #endif
+
+    // Nothing left to navigate to.
+    if (navTargetId != 0) {
+        navTargetId = 0;
+        writeNavTargetFile(0);
+    }
 
     if (hadWaypoints)
         notifyChanged();

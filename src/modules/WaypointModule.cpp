@@ -247,6 +247,61 @@ bool WaypointModule::broadcastDelete(uint32_t waypointId)
 
     return true;
 }
+
+bool WaypointModule::broadcastCreate(const char *name, double lat, double lon, uint32_t expireEpoch)
+{
+    if (!service || !router)
+        return false;
+
+    meshtastic_Waypoint wp = meshtastic_Waypoint_init_zero;
+    // Waypoint id, not a packet id: it is the handle every client uses to edit or delete this
+    // waypoint later, so it has to be stable across the broadcast.
+    wp.id = (uint32_t)random();
+    if (wp.id == 0)
+        wp.id = 1; // some clients treat 0 as "no waypoint"
+    wp.has_latitude_i = true;
+    wp.latitude_i = (int32_t)(lat * 1e7);
+    wp.has_longitude_i = true;
+    wp.longitude_i = (int32_t)(lon * 1e7);
+    wp.expire = expireEpoch;
+    // We created it, so lock it to us: only this radio may edit or delete it mesh-wide.
+    wp.locked_to = nodeDB ? nodeDB->getNodeNum() : 0;
+    if (name)
+        strncpy(wp.name, name, sizeof(wp.name) - 1);
+
+    meshtastic_MeshPacket *p = router->allocForSending();
+    if (!p)
+        return false;
+
+    p->decoded.portnum = meshtastic_PortNum_WAYPOINT_APP;
+    p->decoded.payload.size =
+        pb_encode_to_bytes(p->decoded.payload.bytes, sizeof(p->decoded.payload.bytes), &meshtastic_Waypoint_msg, &wp);
+    if (p->decoded.payload.size == 0) {
+        packetPool.release(p);
+        return false;
+    }
+
+    service->sendToMesh(p, RX_SRC_USER);
+    return true;
+}
+
+bool WaypointModule::createFromCurrentPosition(const char *name, uint32_t expireEpoch)
+{
+    if (!nodeDB)
+        return false;
+
+    const meshtastic_NodeInfoLite *ourNode = nodeDB->getMeshNode(nodeDB->getNodeNum());
+    if (!ourNode)
+        return false;
+
+    meshtastic_PositionLite ownPos = meshtastic_PositionLite_init_zero;
+    if (!nodeDB->copyNodePosition(ourNode->num, ownPos))
+        return false;
+    if (ownPos.latitude_i == 0 && ownPos.longitude_i == 0)
+        return false; // 0,0 is "no fix", not a place
+
+    return broadcastCreate(name, ownPos.latitude_i * 1e-7, ownPos.longitude_i * 1e-7, expireEpoch);
+}
 #endif
 
 #if HAS_SCREEN

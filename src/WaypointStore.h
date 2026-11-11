@@ -47,6 +47,13 @@ class WaypointStore : public Observable<const WaypointStore *>
     const std::deque<StoredWaypoint> &getWaypoints() const { return waypoints; }
     const StoredWaypoint *findWaypoint(uint32_t id) const;
 
+    /// Local navigation target ("go to this waypoint"). Not part of the waypoint payload and never
+    /// broadcast: which waypoint you are walking to is nobody else's business. 0 clears it.
+    bool setNavTarget(uint32_t id);
+    uint32_t getNavTargetId() const { return navTargetId; }
+    /// The waypoint being navigated to, or nullptr when unset, expired or gone from the store.
+    const StoredWaypoint *navTarget() const;
+
     void saveToFlash();
     void loadFromFlash();
     void clearAllWaypoints();
@@ -64,6 +71,7 @@ class WaypointStore : public Observable<const WaypointStore *>
     void notifyChanged();
 
     std::deque<StoredWaypoint> waypoints;
+    uint32_t navTargetId = 0;
 };
 
 #if ENABLE_WAYPOINT_PERSISTENCE
